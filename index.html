@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dynasty Toolkit</title>
+    <style>
+        :root {
+            --bg-color: #121212;
+            --card-bg: #1e1e1e;
+            --accent-color: #00e676;
+            --text-color: #ffffff;
+            --text-dim: #b0b0b0;
+            --border-color: #333333;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            padding-bottom: 70px;
+        }
+
+        header {
+            background-color: var(--card-bg);
+            padding: 15px;
+            text-align: center;
+            font-weight: bold;
+            font-size: 1.2rem;
+            border-bottom: 1px solid var(--border-color);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .container {
+            padding: 15px;
+            max-width: 600px;
+            margin: 0 auto;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .card {
+            background-color: var(--card-bg);
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 10px;
+            border: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .card-left {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .player-name {
+            font-weight: bold;
+            font-size: 1rem;
+        }
+
+        .player-meta {
+            font-size: 0.8rem;
+            color: var(--text-dim);
+            margin-top: 4px;
+        }
+
+        .card-right {
+            text-align: right;
+        }
+
+        .badge {
+            background-color: rgba(0, 230, 118, 0.15);
+            color: var(--accent-color);
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            font-weight: bold;
+        }
+
+        .badge-slot {
+            background-color: #333;
+            color: #fff;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            margin-right: 6px;
+        }
+
+        /* Bottom Nav Bar */
+        .bottom-nav {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 60px;
+            background-color: var(--card-bg);
+            display: flex;
+            justify-content: space-around;
+            align-items: center;
+            border-top: 1px solid var(--border-color);
+            z-index: 1000;
+        }
+
+        .nav-item {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            color: var(--text-dim);
+            font-size: 0.75rem;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        .nav-item.active {
+            color: var(--accent-color);
+        }
+
+        .nav-icon {
+            font-size: 1.2rem;
+            margin-bottom: 2px;
+        }
+
+        button.sync-btn {
+            width: 100%;
+            padding: 12px;
+            background-color: var(--accent-color);
+            color: #000;
+            border: none;
+            border-radius: 6px;
+            font-weight: bold;
+            font-size: 1rem;
+            margin-bottom: 15px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+    <header id="page-title">Start / Sit Lineup</header>
+
+    <div class="container">
+        <button class="sync-btn" onclick="fetchData()">🔄 Sync Sleeper Data</button>
+        <div id="loading" style="display:none; text-align:center; padding: 20px;">Fetching projections & rosters...</div>
+
+        <div id="tab-lineup" class="tab-content active">
+            <div id="lineup-list"></div>
+        </div>
+
+        <div id="tab-waivers" class="tab-content">
+            <div id="waiver-list"></div>
+        </div>
+
+        <div id="tab-drops" class="tab-content">
+            <div id="drop-list"></div>
+        </div>
+
+        <div id="tab-trades" class="tab-content">
+            <div id="trade-list"></div>
+        </div>
+    </div>
+
+    <nav class="bottom-nav">
+        <div class="nav-item active" onclick="switchTab('lineup', 'Start / Sit Lineup', this)">
+            <span class="nav-icon">⚡</span>
+            <span>Lineup</span>
+        </div>
+        <div class="nav-item" onclick="switchTab('waivers', 'Waiver Targets', this)">
+            <span class="nav-icon">🎯</span>
+            <span>Waivers</span>
+        </div>
+        <div class="nav-item" onclick="switchTab('drops', 'Safe Drops', this)">
+            <span class="nav-icon">⚠️</span>
+            <span>Drops</span>
+        </div>
+        <div class="nav-item" onclick="switchTab('trades', 'Dynasty Engine', this)">
+            <span class="nav-icon">🔄</span>
+            <span>Trades</span>
+        </div>
+    </nav>
+
+    <script>
+        const USERNAME = "OnCrewsControl";
+        const WEIGHT_2026 = 0.70;
+        const WEIGHT_2025 = 0.30;
+
+        const TARGET_SLOTS = [
+            "QB", "RB", "RB", "WR", "WR", "TE", "K", "DL", "LB", "DB", "DB",
+            "FLEX", "FLEX", "IDP_FLEX", "IDP_FLEX"
+        ];
+
+        function switchTab(tabId, title, element) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+            
+            document.getElementById(`tab-${tabId}`).classList.add('active');
+            element.classList.add('active');
+            document.getElementById('page-title').innerText = title;
+        }
+
+        function isEligible(pos, slot) {
+            pos = pos.toUpperCase();
+            slot = slot.toUpperCase();
+            if (pos === slot) return true;
+            if (slot === "FLEX" && ["RB", "WR", "TE"].includes(pos)) return true;
+            if (slot === "DL" && ["DL", "DE", "DT"].includes(pos)) return true;
+            if (slot === "DB" && ["DB", "CB", "SS", "FS", "S"].includes(pos)) return true;
+            if (slot === "LB" && ["LB", "OLB", "ILB"].includes(pos)) return true;
+            if (slot === "IDP_FLEX" && ["DL", "DE", "DT", "LB", "DB", "CB", "SS", "FS", "S"].includes(pos)) return true;
+            return false;
+        }
+
+        async function fetchData() {
+            document.getElementById('loading').style.display = 'block';
+            
+            try {
+                const playersDb = await fetch("https://api.sleeper.app/v1/players/nfl").then(r => r.json());
+                const user = await fetch(`https://api.sleeper.app/v1/user/${USERNAME}`).then(r => r.json());
+                const uid = user.user_id;
+
+                const leagues2026 = await fetch(`https://api.sleeper.app/v1/user/${uid}/leagues/nfl/2026`).then(r => r.json());
+                const leagues2025 = await fetch(`https://api.sleeper.app/v1/user/${uid}/leagues/nfl/2025`).then(r => r.json());
+
+                const leagueId2026 = leagues2026[0] ? leagues2026[0].league_id : leagues2025[0].league_id;
+                const rosters = await fetch(`https://api.sleeper.app/v1/league/${leagueId2026}/rosters`).then(r => r.json());
+
+                let myRosterPids = [];
+                let allRosteredPids = new Set();
+
+                rosters.forEach(r => {
+                    (r.players || []).forEach(pid => allRosteredPids.add(pid));
+                    if (r.owner_id === uid) myRosterPids = r.players || [];
+                });
+
+                // Render Start/Sit Mock
+                let lineupHtml = "";
+                myRosterPids.slice(0, 15).forEach((pid, idx) => {
+                    const p = playersDb[pid] || {};
+                    const slot = TARGET_SLOTS[idx] || "BENCH";
+                    lineupHtml += `
+                        <div class="card">
+                            <div class="card-left">
+                                <div><span class="badge-slot">${slot}</span> <span class="player-name">${p.first_name || ''} ${p.last_name || pid}</span></div>
+                                <span class="player-meta">${p.position || 'N/A'} - ${p.team || 'FA'}</span>
+                            </div>
+                            <div class="card-right">
+                                <span class="badge">RAE +5.2</span>
+                            </div>
+                        </div>`;
+                });
+                document.getElementById('lineup-list').innerHTML = lineupHtml;
+
+            } catch (err) {
+                alert("Error fetching Sleeper data. Check your connection.");
+            } finally {
+                document.getElementById('loading').style.display = 'none';
+            }
+        }
+    </script>
+</body>
+</html>
