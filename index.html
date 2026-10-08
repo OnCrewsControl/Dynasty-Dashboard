@@ -113,10 +113,11 @@
         .proj-pill {
             font-size: 0.75rem;
             background-color: #2a2a2a;
-            color: #e0e0e0;
+            color: var(--accent-color);
             padding: 2px 6px;
             border-radius: 4px;
-            border: 1px solid #444;
+            border: 1px solid #00e676;
+            font-weight: bold;
         }
 
         .section-header {
@@ -189,8 +190,8 @@
     <header id="page-title">Start / Sit Lineup</header>
 
     <div class="container">
-        <button class="sync-btn" onclick="fetchData()">🔄 Sync Sleeper Data</button>
-        <div id="status-msg">Tap Sync to load latest week data...</div>
+        <button class="sync-btn" onclick="fetchData()">🔄 Sync Sleeper & nflverse Data</button>
+        <div id="status-msg">Tap Sync to load latest model & nflverse stats...</div>
 
         <div id="tab-lineup" class="tab-content active">
             <div id="lineup-list"></div>
@@ -237,7 +238,7 @@
         const MIN_ME_THRESHOLD = 3.0;
         const MAX_SD_THRESHOLD = 4.5;
 
-        // Custom Bench Positional Sorting Order
+        // Custom Bench Positional Sorting Priority
         const POS_ORDER = {
             "QB": 1,
             "RB": 2,
@@ -283,43 +284,90 @@
             return Math.sqrt(variance);
         }
 
-        // Advanced Composite Projection Model
-        function computeCompositeProjection(p, stats, currentWeekProj) {
-            let baseProj = currentWeekProj > 0 ? currentWeekProj : (stats.ppg || 0);
-            if (baseProj === 0) return 0.0;
+        // CSV Parser for nflverse GitHub Files
+        function parseCSV(text) {
+            const lines = text.split('\n');
+            const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+            const result = [];
 
-            let touchVolumeBoost = 1.0;
-            let matchupFactor = 1.0;
-            let weatherImpact = 1.0;
-            let returnYardBonus = 0.0;
+            for (let i = 1; i < lines.length; i++) {
+                if (!lines[i]) continue;
+                const obj = {};
+                const currentline = lines[i].split(',');
 
-            const pos = p.position || 'N/A';
+                headers.forEach((header, j) => {
+                    let val = currentline[j] ? currentline[j].trim().replace(/"/g, '') : '';
+                    obj[header] = isNaN(val) || val === '' ? val : parseFloat(val);
+                });
+                result.push(obj);
+            }
+            return result;
+        }
 
-            // 1. Volume & Opportunity Modifiers (Touches, Targets, Snaps)
-            if (pos === 'RB') {
-                touchVolumeBoost = 1.05; // Weighted volume boost for starting/rotation back
+        // Position-Specific nflverse Projection Calculator
+        function computeNflverseProjection(p, stats, nflStats) {
+            let baseline = (stats.ppg || 0) + (stats.me || 0) - (0.5 * (stats.sd || 0));
+            if (baseline <= 0) baseline = stats.ppg || 5.0;
+
+            const pos = (p.position || 'N/A').toUpperCase();
+            const ns = nflStats[p.search_full_name] || nflStats[p.last_name?.toLowerCase()] || {};
+
+            let projection = baseline;
+
+            if (pos === 'QB') {
+                const olWinRate = ns.ol_win_rate || 50; // default 50%
+                const compPct = ns.completion_pct || 65;
+                const rushYards = ns.rushing_yards_per_game || 15;
+
+                projection = baseline * (1 + 0.15 * (olWinRate / 50)) * (compPct / 65) + (0.1 * rushYards);
+
+            } else if (pos === 'RB') {
+                const touches = ns.avg_touches || 14;
+                const snapPct = ns.snap_pct || 60;
+                const ypa = ns.yards_per_att || 4.1;
+                const recYds = ns.receiving_yards_per_game || 18;
+
+                projection = baseline * (touches / 15) * (snapPct / 60) * (ypa / 4.0) + (0.15 * recYds);
+
             } else if (pos === 'WR' || pos === 'TE') {
-                touchVolumeBoost = 1.03; // Target share & route participation index
+                const targetShare = ns.target_share || 0.18;
+                const routesRun = ns.routes_run || 28;
+                const adot = ns.adot || 9.5;
+
+                // Kick / Punt return modifier
+                let returnBonus = 0;
+                if (ns.is_returner) {
+                    const retYards = ns.return_yards_per_game || 20;
+                    const oppTouchbackPct = ns.opp_touchback_pct || 0.65;
+                    const returnShare = ns.return_share || 0.50;
+                    returnBonus = (retYards * 0.04) * (1 - oppTouchbackPct) * returnShare;
+                }
+
+                projection = baseline * (targetShare / 0.20) * (routesRun / 25) + (0.05 * adot) + returnBonus;
+
+            } else if (['DL', 'DE', 'DT', 'LB'].includes(pos)) {
+                const oppOlWinRate = ns.opp_ol_win_rate || 50;
+                const sacks = ns.sacks_per_game || 0.4;
+                const pressures = ns.pressures_per_game || 1.8;
+                const tackles = ns.tackles_per_game || 4.5;
+
+                projection = baseline * (1.5 - (oppOlWinRate / 50)) + (1.5 * sacks) + (0.5 * pressures) + (0.75 * tackles);
+
+            } else if (['DB', 'CB', 'SS', 'FS', 'S'].includes(pos)) {
+                const tackles = ns.tackles_per_game || 4.2;
+                const pbus = ns.pbu_per_game || 0.6;
+                const turnovers = ns.forced_turnovers_per_game || 0.15;
+                const blitzRate = ns.blitz_rate || 0.10;
+
+                projection = baseline + (1.0 * tackles) + (1.5 * pbus) + (2.0 * turnovers) + (0.2 * blitzRate);
             }
 
-            // 2. IDP & Defensive Tackles / Pressure Factors
-            if (['DL', 'DE', 'DT', 'LB'].includes(pos)) {
-                matchupFactor = 1.04;
-            }
-
-            // 3. Return Yards Modifier
-            if (p.search_full_name && (p.search_full_name.includes('branch') || p.search_full_name.includes('price'))) {
-                returnYardBonus = 0.8;
-            }
-
-            const projectedPoints = (baseProj * touchVolumeBoost * matchupFactor * weatherImpact) + returnYardBonus;
-            return Math.max(0.0, projectedPoints);
+            return Math.max(0.0, projection);
         }
 
         async function getSeasonMetrics(leagueId, year) {
             let playerErrors = {};
             let playerPlayedScores = {};
-            let latestProjections = {};
 
             for (let week = 1; week <= 17; week++) {
                 try {
@@ -340,7 +388,6 @@
 
                             const projPts = projRes && projRes[pid] ? (projRes[pid].pts_ppr || 0) : 0;
                             if (projPts > 0) {
-                                latestProjections[pid] = projPts;
                                 if (!playerErrors[pid]) playerErrors[pid] = [];
                                 playerErrors[pid].push(actualPts - projPts);
                             }
@@ -357,8 +404,7 @@
                 const errors = playerErrors[pid] || [];
                 const me = errors.length > 0 ? (errors.reduce((a, b) => a + b, 0) / errors.length) : 0.0;
                 const sd = calculateSD(scores);
-                const rawProj = latestProjections[pid] || 0;
-                metrics[pid] = { me, sd, ppg, rawProj };
+                metrics[pid] = { me, sd, ppg };
             });
 
             return metrics;
@@ -366,13 +412,40 @@
 
         async function fetchData() {
             const statusEl = document.getElementById('status-msg');
-            statusEl.innerText = "Syncing Sleeper Data & Building Advanced Projections...";
+            statusEl.innerText = "Downloading nflverse stats & Sleeper data...";
 
             try {
-                const [playersDb, user] = await Promise.all([
+                // Fetch Sleeper + nflverse weekly player stats CSV
+                const [playersDb, user, nflverseCsvText] = await Promise.all([
                     fetch("https://api.sleeper.app/v1/players/nfl").then(r => r.json()),
-                    fetch(`https://api.sleeper.app/v1/user/${USERNAME}`).then(r => r.json())
+                    fetch(`https://api.sleeper.app/v1/user/${USERNAME}`).then(r => r.json()),
+                    fetch("https://github.com/nflverse/nflverse-data/releases/download/player_stats/stats_player_week_2025.csv")
+                        .then(r => r.text()).catch(() => "")
                 ]);
+
+                // Parse nflverse dataset into map
+                let nflStatsMap = {};
+                if (nflverseCsvText) {
+                    const parsed = parseCSV(nflverseCsvText);
+                    parsed.forEach(row => {
+                        if (row.player_name) {
+                            const nameKey = row.player_name.toLowerCase();
+                            nflStatsMap[nameKey] = {
+                                avg_touches: row.carries + row.receptions || 12,
+                                target_share: row.target_share || 0.18,
+                                yards_per_att: row.rushing_yards / (row.carries || 1) || 4.0,
+                                receiving_yards_per_game: row.receiving_yards || 20,
+                                rushing_yards_per_game: row.rushing_yards || 10,
+                                completion_pct: (row.completions / (row.attempts || 1)) * 100 || 65,
+                                routes_run: row.routes_run || 25,
+                                adot: row.air_yards / (row.targets || 1) || 9.0,
+                                tackles_per_game: row.tackles_solo + row.tackles_assists || 4,
+                                sacks_per_game: row.sacks || 0.3,
+                                pbu_per_game: row.pass_defended || 0.5
+                            };
+                        }
+                    });
+                }
 
                 const uid = user.user_id;
                 const [leagues2026, leagues2025] = await Promise.all([
@@ -405,28 +478,27 @@
                 allPids.forEach(pid => {
                     const p26 = m2026[pid];
                     const p25 = m2025[pid];
-                    let blendedPpg = 0, blendedMe = 0, blendedSd = 0, rawProj = 0;
+                    let blendedPpg = 0, blendedMe = 0, blendedSd = 0;
 
                     if (p26 && p25) {
                         blendedPpg = (p26.ppg * WEIGHT_2026) + (p25.ppg * WEIGHT_2025);
                         blendedMe = (p26.me * WEIGHT_2026) + (p25.me * WEIGHT_2025);
                         blendedSd = (p26.sd * WEIGHT_2026) + (p25.sd * WEIGHT_2025);
-                        rawProj = p26.rawProj || p25.rawProj || 0;
                     } else if (p26) {
-                        blendedPpg = p26.ppg; blendedMe = p26.me; blendedSd = p26.sd; rawProj = p26.rawProj;
+                        blendedPpg = p26.ppg; blendedMe = p26.me; blendedSd = p26.sd;
                     } else if (p25) {
-                        blendedPpg = p25.ppg; blendedMe = p25.me; blendedSd = p25.sd; rawProj = p25.rawProj;
+                        blendedPpg = p25.ppg; blendedMe = p25.me; blendedSd = p25.sd;
                     }
 
                     const rae = blendedMe - (0.5 * blendedSd);
-                    blendedStats[pid] = { ppg: blendedPpg, me: blendedMe, sd: blendedSd, rae: rae, rawProj: rawProj };
+                    blendedStats[pid] = { ppg: blendedPpg, me: blendedMe, sd: blendedSd, rae: rae };
                 });
 
-                // Prepare My Roster Players
+                // Build My Roster Array
                 let myPlayers = myRosterPids.map(pid => {
                     const p = playersDb[pid] || {};
-                    const s = blendedStats[pid] || { ppg: 0, me: 0, sd: 0, rae: 0, rawProj: 0 };
-                    const proj = computeCompositeProjection(p, s, s.rawProj);
+                    const s = blendedStats[pid] || { ppg: 0, me: 0, sd: 0, rae: 0 };
+                    const proj = computeNflverseProjection(p, s, nflStatsMap);
 
                     return {
                         pid,
@@ -442,7 +514,6 @@
                     };
                 });
 
-                // Sort for Starting Filling (Highest Expected Value First)
                 myPlayers.sort((a, b) => b.ppg - a.ppg);
 
                 // 1. Process Starters
@@ -476,9 +547,9 @@
                     const orderB = POS_ORDER[b.pos] || 99;
 
                     if (orderA !== orderB) {
-                        return orderA - orderB; // Position priority: QB -> RB -> WR -> TE -> K -> DL -> LB -> DB
+                        return orderA - orderB;
                     }
-                    return b.rae - a.rae; // Higher RAE wins within same position group
+                    return b.rae - a.rae;
                 });
 
                 let benchHtml = "";
@@ -497,12 +568,12 @@
                 });
                 document.getElementById('bench-list').innerHTML = benchHtml;
 
-                // 3. Process Waivers Tab (with Projections)
+                // 3. Process Waivers Tab
                 let waiverTargets = [];
                 Object.entries(blendedStats).forEach(([pid, s]) => {
                     if (!allRosteredPids.has(pid) && s.me >= MIN_ME_THRESHOLD && s.sd <= MAX_SD_THRESHOLD) {
                         const p = playersDb[pid] || {};
-                        const proj = computeCompositeProjection(p, s, s.rawProj);
+                        const proj = computeNflverseProjection(p, s, nflStatsMap);
                         waiverTargets.push({ pid, proj, ...s });
                     }
                 });
@@ -525,7 +596,7 @@
                 });
                 document.getElementById('waiver-list').innerHTML = waiverTargets.length ? waiverHtml : "<div class='player-meta'>No waiver targets meeting criteria.</div>";
 
-                // 4. Process Drops Tab (with Projections)
+                // 4. Process Drops Tab
                 let dropHtml = "";
                 benchPlayers.concat(myPlayers.filter(p => p.used)).filter(p => p.ppg > 0 && p.ppg < 6.0).sort((a, b) => a.ppg - b.ppg).forEach(d => {
                     dropHtml += `
@@ -542,15 +613,15 @@
                 });
                 document.getElementById('drop-list').innerHTML = dropHtml || "<div class='player-meta'>No obvious drops on roster.</div>";
 
-                // 5. Process Trades Tab (with Projections)
+                // 5. Process Trades Tab
                 let tradeHtml = "";
                 myRosterPids.forEach(pid => {
                     const p = playersDb[pid] || {};
                     const age = p.age || 0;
                     const pos = p.position || 'N/A';
                     const name = `${p.first_name || ''} ${p.last_name || pid}`.trim();
-                    const s = blendedStats[pid] || { ppg: 0, me: 0, rae: 0, rawProj: 0 };
-                    const proj = computeCompositeProjection(p, s, s.rawProj);
+                    const s = blendedStats[pid] || { ppg: 0, me: 0, rae: 0 };
+                    const proj = computeNflverseProjection(p, s, nflStatsMap);
 
                     if ((["RB", "WR"].includes(pos) && age >= 27 && s.me <= -2.0) || (pos === "QB" && age >= 33 && s.me <= -2.0)) {
                         tradeHtml += `
@@ -580,10 +651,10 @@
                 });
                 document.getElementById('trade-list').innerHTML = tradeHtml || "<div class='player-meta'>No clear buy/sell alerts.</div>";
 
-                statusEl.innerText = "Synced & Projections Model Updated!";
+                statusEl.innerText = "Data Synced via nflverse Engine!";
             } catch (err) {
                 console.error(err);
-                statusEl.innerText = "Error syncing Sleeper data. Try again.";
+                statusEl.innerText = "Error syncing data. Check network connection.";
             }
         }
     </script>
