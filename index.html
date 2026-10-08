@@ -250,6 +250,18 @@
             "DB": 8, "CB": 8, "SS": 8, "FS": 8, "S": 8
         };
 
+        // Realistic Cap Upper Limits by Position Group
+        const POS_CAPS = {
+            "QB": 38.0,
+            "RB": 32.0,
+            "WR": 32.0,
+            "TE": 25.0,
+            "K": 18.0,
+            "DL": 18.0, "DE": 18.0, "DT": 18.0,
+            "LB": 18.0, "OLB": 18.0, "ILB": 18.0,
+            "DB": 16.0, "CB": 16.0, "SS": 16.0, "FS": 16.0, "S": 16.0
+        };
+
         const TARGET_SLOTS = [
             "QB", "RB", "RB", "WR", "WR", "TE", "K", "DL", "LB", "DB", "DB",
             "FLEX", "FLEX", "IDP_FLEX", "IDP_FLEX"
@@ -284,9 +296,9 @@
             return Math.sqrt(variance);
         }
 
-        // CSV Parser for nflverse GitHub Files
         function parseCSV(text) {
             const lines = text.split('\n');
+            if (lines.length < 2) return [];
             const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
             const result = [];
 
@@ -304,65 +316,51 @@
             return result;
         }
 
-        // Position-Specific nflverse Projection Calculator
+        // Calibrated Multiplier Projection Engine
         function computeNflverseProjection(p, stats, nflStats) {
-            let baseline = (stats.ppg || 0) + (stats.me || 0) - (0.5 * (stats.sd || 0));
-            if (baseline <= 0) baseline = stats.ppg || 5.0;
+            let baseline = (stats.ppg || 0) + (0.3 * (stats.me || 0)) - (0.2 * (stats.sd || 0));
+            if (baseline <= 0) baseline = stats.ppg || 4.0;
 
             const pos = (p.position || 'N/A').toUpperCase();
-            const ns = nflStats[p.search_full_name] || nflStats[p.last_name?.toLowerCase()] || {};
+            const fullNameKey = (p.search_full_name || '').toLowerCase();
+            const lastNameKey = (p.last_name || '').toLowerCase();
+            const ns = nflStats[fullNameKey] || nflStats[lastNameKey] || {};
 
             let projection = baseline;
 
             if (pos === 'QB') {
-                const olWinRate = ns.ol_win_rate || 50; // default 50%
-                const compPct = ns.completion_pct || 65;
-                const rushYards = ns.rushing_yards_per_game || 15;
-
-                projection = baseline * (1 + 0.15 * (olWinRate / 50)) * (compPct / 65) + (0.1 * rushYards);
+                const compPct = ns.completion_pct || 64.0;
+                const rushYards = ns.rushing_yards_per_game || 10.0;
+                projection = baseline * (compPct / 64.0) + (0.05 * rushYards);
 
             } else if (pos === 'RB') {
-                const touches = ns.avg_touches || 14;
-                const snapPct = ns.snap_pct || 60;
-                const ypa = ns.yards_per_att || 4.1;
-                const recYds = ns.receiving_yards_per_game || 18;
-
-                projection = baseline * (touches / 15) * (snapPct / 60) * (ypa / 4.0) + (0.15 * recYds);
+                const touches = ns.avg_touches || 12.0;
+                const ypa = ns.yards_per_att || 4.0;
+                projection = baseline * Math.min(1.25, Math.max(0.75, (touches / 12.0))) * Math.min(1.2, Math.max(0.8, (ypa / 4.0)));
 
             } else if (pos === 'WR' || pos === 'TE') {
-                const targetShare = ns.target_share || 0.18;
-                const routesRun = ns.routes_run || 28;
-                const adot = ns.adot || 9.5;
-
-                // Kick / Punt return modifier
-                let returnBonus = 0;
-                if (ns.is_returner) {
-                    const retYards = ns.return_yards_per_game || 20;
-                    const oppTouchbackPct = ns.opp_touchback_pct || 0.65;
-                    const returnShare = ns.return_share || 0.50;
-                    returnBonus = (retYards * 0.04) * (1 - oppTouchbackPct) * returnShare;
-                }
-
-                projection = baseline * (targetShare / 0.20) * (routesRun / 25) + (0.05 * adot) + returnBonus;
+                const targetShare = ns.target_share || 0.16;
+                const adot = ns.adot || 9.0;
+                projection = baseline * Math.min(1.3, Math.max(0.7, (targetShare / 0.16))) + (0.02 * adot);
 
             } else if (['DL', 'DE', 'DT', 'LB'].includes(pos)) {
-                const oppOlWinRate = ns.opp_ol_win_rate || 50;
-                const sacks = ns.sacks_per_game || 0.4;
-                const pressures = ns.pressures_per_game || 1.8;
-                const tackles = ns.tackles_per_game || 4.5;
-
-                projection = baseline * (1.5 - (oppOlWinRate / 50)) + (1.5 * sacks) + (0.5 * pressures) + (0.75 * tackles);
+                // Calibrated IDP Multipliers (Capped Multiplier Growth)
+                const sacks = ns.sacks_per_game || 0.25;
+                const tackles = ns.tackles_per_game || 4.0;
+                const pressureBonus = (sacks * 0.4) + (tackles * 0.1);
+                projection = (baseline * 0.85) + pressureBonus;
 
             } else if (['DB', 'CB', 'SS', 'FS', 'S'].includes(pos)) {
-                const tackles = ns.tackles_per_game || 4.2;
-                const pbus = ns.pbu_per_game || 0.6;
-                const turnovers = ns.forced_turnovers_per_game || 0.15;
-                const blitzRate = ns.blitz_rate || 0.10;
-
-                projection = baseline + (1.0 * tackles) + (1.5 * pbus) + (2.0 * turnovers) + (0.2 * blitzRate);
+                // Grounded DB Model preventing run-away projections
+                const tackles = ns.tackles_per_game || 4.5;
+                const pbus = ns.pbu_per_game || 0.4;
+                const defensiveBonus = (tackles * 0.12) + (pbus * 0.2);
+                projection = (baseline * 0.80) + defensiveBonus;
             }
 
-            return Math.max(0.0, projection);
+            // Apply Hard Position Group Ceilings
+            const cap = POS_CAPS[pos] || 25.0;
+            return Math.min(cap, Math.max(1.0, projection));
         }
 
         async function getSeasonMetrics(leagueId, year) {
@@ -415,7 +413,6 @@
             statusEl.innerText = "Downloading nflverse stats & Sleeper data...";
 
             try {
-                // Fetch Sleeper + nflverse weekly player stats CSV
                 const [playersDb, user, nflverseCsvText] = await Promise.all([
                     fetch("https://api.sleeper.app/v1/players/nfl").then(r => r.json()),
                     fetch(`https://api.sleeper.app/v1/user/${USERNAME}`).then(r => r.json()),
@@ -423,27 +420,60 @@
                         .then(r => r.text()).catch(() => "")
                 ]);
 
-                // Parse nflverse dataset into map
+                // Aggregate nflverse stats by player per-game averages
                 let nflStatsMap = {};
                 if (nflverseCsvText) {
                     const parsed = parseCSV(nflverseCsvText);
+                    let totalsMap = {};
+
                     parsed.forEach(row => {
                         if (row.player_name) {
-                            const nameKey = row.player_name.toLowerCase();
-                            nflStatsMap[nameKey] = {
-                                avg_touches: row.carries + row.receptions || 12,
-                                target_share: row.target_share || 0.18,
-                                yards_per_att: row.rushing_yards / (row.carries || 1) || 4.0,
-                                receiving_yards_per_game: row.receiving_yards || 20,
-                                rushing_yards_per_game: row.rushing_yards || 10,
-                                completion_pct: (row.completions / (row.attempts || 1)) * 100 || 65,
-                                routes_run: row.routes_run || 25,
-                                adot: row.air_yards / (row.targets || 1) || 9.0,
-                                tackles_per_game: row.tackles_solo + row.tackles_assists || 4,
-                                sacks_per_game: row.sacks || 0.3,
-                                pbu_per_game: row.pass_defended || 0.5
-                            };
+                            const key = row.player_name.toLowerCase();
+                            if (!totalsMap[key]) {
+                                totalsMap[key] = {
+                                    g_count: 0,
+                                    carries: 0,
+                                    receptions: 0,
+                                    rushing_yards: 0,
+                                    receiving_yards: 0,
+                                    target_share_sum: 0,
+                                    completions: 0,
+                                    attempts: 0,
+                                    air_yards: 0,
+                                    tackles: 0,
+                                    sacks: 0,
+                                    pbu: 0
+                                };
+                            }
+                            const t = totalsMap[key];
+                            t.g_count += 1;
+                            t.carries += row.carries || 0;
+                            t.receptions += row.receptions || 0;
+                            t.rushing_yards += row.rushing_yards || 0;
+                            t.receiving_yards += row.receiving_yards || 0;
+                            t.target_share_sum += row.target_share || 0.15;
+                            t.completions += row.completions || 0;
+                            t.attempts += row.attempts || 0;
+                            t.air_yards += row.air_yards || 0;
+                            t.tackles += (row.tackles_solo || 0) + (row.tackles_assists || 0);
+                            t.sacks += row.sacks || 0;
+                            t.pbu += row.pass_defended || 0;
                         }
+                    });
+
+                    Object.entries(totalsMap).forEach(([k, t]) => {
+                        const games = Math.max(1, t.g_count);
+                        nflStatsMap[k] = {
+                            avg_touches: (t.carries + t.receptions) / games,
+                            target_share: t.target_share_sum / games,
+                            yards_per_att: t.carries > 0 ? (t.rushing_yards / t.carries) : 4.0,
+                            rushing_yards_per_game: t.rushing_yards / games,
+                            completion_pct: t.attempts > 0 ? ((t.completions / t.attempts) * 100) : 64.0,
+                            adot: t.receptions > 0 ? (t.air_yards / t.receptions) : 8.5,
+                            tackles_per_game: t.tackles / games,
+                            sacks_per_game: t.sacks / games,
+                            pbu_per_game: t.pbu / games
+                        };
                     });
                 }
 
@@ -651,7 +681,7 @@
                 });
                 document.getElementById('trade-list').innerHTML = tradeHtml || "<div class='player-meta'>No clear buy/sell alerts.</div>";
 
-                statusEl.innerText = "Data Synced via nflverse Engine!";
+                statusEl.innerText = "Data Synced & Projections Normalized!";
             } catch (err) {
                 console.error(err);
                 statusEl.innerText = "Error syncing data. Check network connection.";
