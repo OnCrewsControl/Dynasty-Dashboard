@@ -12,6 +12,8 @@
             --text-color: #ffffff;
             --text-dim: #b0b0b0;
             --border-color: #333333;
+            --danger-color: #ff5252;
+            --warning-color: #ffab00;
         }
 
         body {
@@ -20,7 +22,7 @@
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
             background-color: var(--bg-color);
             color: var(--text-color);
-            padding-bottom: 70px;
+            padding-bottom: 80px;
         }
 
         header {
@@ -63,6 +65,7 @@
         .card-left {
             display: flex;
             flex-direction: column;
+            gap: 4px;
         }
 
         .player-name {
@@ -73,11 +76,14 @@
         .player-meta {
             font-size: 0.8rem;
             color: var(--text-dim);
-            margin-top: 4px;
         }
 
         .card-right {
             text-align: right;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 4px;
         }
 
         .badge {
@@ -89,6 +95,11 @@
             font-weight: bold;
         }
 
+        .badge-danger {
+            background-color: rgba(255, 82, 82, 0.15);
+            color: var(--danger-color);
+        }
+
         .badge-slot {
             background-color: #333;
             color: #fff;
@@ -96,6 +107,16 @@
             border-radius: 4px;
             font-size: 0.75rem;
             margin-right: 6px;
+            font-weight: bold;
+        }
+
+        .section-header {
+            font-size: 0.9rem;
+            font-weight: bold;
+            color: var(--text-dim);
+            margin: 15px 0 10px 0;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
 
         /* Bottom Nav Bar */
@@ -121,6 +142,7 @@
             font-size: 0.75rem;
             text-decoration: none;
             cursor: pointer;
+            width: 25%;
         }
 
         .nav-item.active {
@@ -144,6 +166,13 @@
             margin-bottom: 15px;
             cursor: pointer;
         }
+
+        #status-msg {
+            text-align: center;
+            padding: 10px;
+            font-size: 0.9rem;
+            color: var(--warning-color);
+        }
     </style>
 </head>
 <body>
@@ -152,10 +181,12 @@
 
     <div class="container">
         <button class="sync-btn" onclick="fetchData()">🔄 Sync Sleeper Data</button>
-        <div id="loading" style="display:none; text-align:center; padding: 20px;">Fetching projections & rosters...</div>
+        <div id="status-msg">Tap Sync to load latest week data...</div>
 
         <div id="tab-lineup" class="tab-content active">
             <div id="lineup-list"></div>
+            <div class="section-header">BENCH DEPTH</div>
+            <div id="bench-list"></div>
         </div>
 
         <div id="tab-waivers" class="tab-content">
@@ -194,6 +225,8 @@
         const USERNAME = "OnCrewsControl";
         const WEIGHT_2026 = 0.70;
         const WEIGHT_2025 = 0.30;
+        const MIN_ME_THRESHOLD = 3.0;
+        const MAX_SD_THRESHOLD = 4.5;
 
         const TARGET_SLOTS = [
             "QB", "RB", "RB", "WR", "WR", "TE", "K", "DL", "LB", "DB", "DB",
@@ -210,6 +243,7 @@
         }
 
         function isEligible(pos, slot) {
+            if (!pos) return false;
             pos = pos.toUpperCase();
             slot = slot.toUpperCase();
             if (pos === slot) return true;
@@ -221,18 +255,78 @@
             return false;
         }
 
+        function calculateSD(arr) {
+            if (arr.length <= 1) return 0.0;
+            const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+            const variance = arr.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / (arr.length - 1);
+            return Math.sqrt(variance);
+        }
+
+        async function getSeasonMetrics(leagueId, year) {
+            let playerErrors = {};
+            let playerPlayedScores = {};
+
+            for (let week = 1; week <= 17; week++) {
+                try {
+                    const [projRes, matchRes] = await Promise.all([
+                        fetch(`https://api.sleeper.app/v1/projections/nfl/regular/${year}/${week}`).then(r => r.json()).catch(() => ({})),
+                        fetch(`https://api.sleeper.app/v1/league/${leagueId}/matchups/${week}`).then(r => r.json()).catch(() => ([]))
+                    ]);
+
+                    if (!matchRes || !Array.isArray(matchRes)) continue;
+
+                    matchRes.forEach(team => {
+                        const points = team.players_points || {};
+                        Object.entries(points).forEach(([pid, actualPts]) => {
+                            if (actualPts === null || actualPts <= 0) return;
+
+                            if (!playerPlayedScores[pid]) playerPlayedScores[pid] = [];
+                            playerPlayedScores[pid].push(actualPts);
+
+                            const projPts = projRes && projRes[pid] ? (projRes[pid].pts_ppr || 0) : 0;
+                            if (projPts > 0) {
+                                if (!playerErrors[pid]) playerErrors[pid] = [];
+                                playerErrors[pid].push(actualPts - projPts);
+                            }
+                        });
+                    });
+                } catch (e) {
+                    continue;
+                }
+            }
+
+            let metrics = {};
+            Object.entries(playerPlayedScores).forEach(([pid, scores]) => {
+                const ppg = scores.reduce((a, b) => a + b, 0) / scores.length;
+                const errors = playerErrors[pid] || [];
+                const me = errors.length > 0 ? (errors.reduce((a, b) => a + b, 0) / errors.length) : 0.0;
+                const sd = calculateSD(scores);
+                metrics[pid] = { me, sd, ppg };
+            });
+
+            return metrics;
+        }
+
         async function fetchData() {
-            document.getElementById('loading').style.display = 'block';
-            
+            const statusEl = document.getElementById('status-msg');
+            statusEl.innerText = "Processing Sleeper metrics (70/30 weight)...";
+
             try {
-                const playersDb = await fetch("https://api.sleeper.app/v1/players/nfl").then(r => r.json());
-                const user = await fetch(`https://api.sleeper.app/v1/user/${USERNAME}`).then(r => r.json());
+                const [playersDb, user] = await Promise.all([
+                    fetch("https://api.sleeper.app/v1/players/nfl").then(r => r.json()),
+                    fetch(`https://api.sleeper.app/v1/user/${USERNAME}`).then(r => r.json())
+                ]);
+
                 const uid = user.user_id;
+                const [leagues2026, leagues2025] = await Promise.all([
+                    fetch(`https://api.sleeper.app/v1/user/${uid}/leagues/nfl/2026`).then(r => r.json()).catch(() => []),
+                    fetch(`https://api.sleeper.app/v1/user/${uid}/leagues/nfl/2025`).then(r => r.json()).catch(() => [])
+                ]);
 
-                const leagues2026 = await fetch(`https://api.sleeper.app/v1/user/${uid}/leagues/nfl/2026`).then(r => r.json());
-                const leagues2025 = await fetch(`https://api.sleeper.app/v1/user/${uid}/leagues/nfl/2025`).then(r => r.json());
+                const currentLeague = leagues2026[0] || leagues2025[0];
+                const leagueId2026 = currentLeague.league_id;
+                const leagueId2025 = leagues2025[0] ? leagues2025[0].league_id : leagueId2026;
 
-                const leagueId2026 = leagues2026[0] ? leagues2026[0].league_id : leagues2025[0].league_id;
                 const rosters = await fetch(`https://api.sleeper.app/v1/league/${leagueId2026}/rosters`).then(r => r.json());
 
                 let myRosterPids = [];
@@ -243,28 +337,168 @@
                     if (r.owner_id === uid) myRosterPids = r.players || [];
                 });
 
-                // Render Start/Sit Mock
-                let lineupHtml = "";
-                myRosterPids.slice(0, 15).forEach((pid, idx) => {
+                const [m2026, m2025] = await Promise.all([
+                    getSeasonMetrics(leagueId2026, 2026),
+                    getSeasonMetrics(leagueId2025, 2025)
+                ]);
+
+                let blendedStats = {};
+                const allPids = new Set([...Object.keys(m2026), ...Object.keys(m2025)]);
+
+                allPids.forEach(pid => {
+                    const p26 = m2026[pid];
+                    const p25 = m2025[pid];
+                    let blendedPpg = 0, blendedMe = 0, blendedSd = 0;
+
+                    if (p26 && p25) {
+                        blendedPpg = (p26.ppg * WEIGHT_2026) + (p25.ppg * WEIGHT_2025);
+                        blendedMe = (p26.me * WEIGHT_2026) + (p25.me * WEIGHT_2025);
+                        blendedSd = (p26.sd * WEIGHT_2026) + (p25.sd * WEIGHT_2025);
+                    } else if (p26) {
+                        blendedPpg = p26.ppg; blendedMe = p26.me; blendedSd = p26.sd;
+                    } else if (p25) {
+                        blendedPpg = p25.ppg; blendedMe = p25.me; blendedSd = p25.sd;
+                    }
+
+                    const rae = blendedMe - (0.5 * blendedSd);
+                    blendedStats[pid] = { ppg: blendedPpg, me: blendedMe, sd: blendedSd, rae: rae };
+                });
+
+                // 1. Process Lineup (Start / Sit)
+                let myPlayers = myRosterPids.map(pid => {
                     const p = playersDb[pid] || {};
-                    const slot = TARGET_SLOTS[idx] || "BENCH";
-                    lineupHtml += `
+                    const s = blendedStats[pid] || { ppg: 0, me: 0, sd: 0, rae: 0 };
+                    return {
+                        pid,
+                        name: `${p.first_name || ''} ${p.last_name || pid}`.trim(),
+                        pos: p.position || 'N/A',
+                        team: p.team || 'FA',
+                        ppg: s.ppg,
+                        me: s.me,
+                        sd: s.sd,
+                        rae: s.rae,
+                        used: false
+                    };
+                });
+
+                myPlayers.sort((a, b) => b.ppg - a.ppg);
+
+                let startersHtml = "";
+                TARGET_SLOTS.forEach(slot => {
+                    for (let p of myPlayers) {
+                        if (!p.used && isEligible(p.pos, slot)) {
+                            p.used = true;
+                            startersHtml += `
+                                <div class="card">
+                                    <div class="card-left">
+                                        <div><span class="badge-slot">${slot}</span> <span class="player-name">${p.name}</span></div>
+                                        <span class="player-meta">${p.pos} - ${p.team} | PPG: ${p.ppg.toFixed(1)} | ME: ${p.me >= 0 ? '+' : ''}${p.me.toFixed(1)}</span>
+                                    </div>
+                                    <div class="card-right">
+                                        <span class="badge ${p.rae < 0 ? 'badge-danger' : ''}">RAE ${p.rae >= 0 ? '+' : ''}${p.rae.toFixed(1)}</span>
+                                    </div>
+                                </div>`;
+                            break;
+                        }
+                    }
+                });
+                document.getElementById('lineup-list').innerHTML = startersHtml;
+
+                let benchHtml = "";
+                myPlayers.filter(p => !p.used).forEach(p => {
+                    benchHtml += `
                         <div class="card">
                             <div class="card-left">
-                                <div><span class="badge-slot">${slot}</span> <span class="player-name">${p.first_name || ''} ${p.last_name || pid}</span></div>
-                                <span class="player-meta">${p.position || 'N/A'} - ${p.team || 'FA'}</span>
+                                <div><span class="badge-slot">BENCH</span> <span class="player-name">${p.name}</span></div>
+                                <span class="player-meta">${p.pos} - ${p.team} | PPG: ${p.ppg.toFixed(1)} | ME: ${p.me >= 0 ? '+' : ''}${p.me.toFixed(1)}</span>
                             </div>
                             <div class="card-right">
-                                <span class="badge">RAE +5.2</span>
+                                <span class="badge ${p.rae < 0 ? 'badge-danger' : ''}">RAE ${p.rae >= 0 ? '+' : ''}${p.rae.toFixed(1)}</span>
                             </div>
                         </div>`;
                 });
-                document.getElementById('lineup-list').innerHTML = lineupHtml;
+                document.getElementById('bench-list').innerHTML = benchHtml;
 
+                // 2. Process Waivers Tab
+                let waiverTargets = [];
+                Object.entries(blendedStats).forEach(([pid, s]) => {
+                    if (!allRosteredPids.has(pid) && s.me >= MIN_ME_THRESHOLD && s.sd <= MAX_SD_THRESHOLD) {
+                        waiverTargets.push({ pid, ...s });
+                    }
+                });
+                waiverTargets.sort((a, b) => b.rae - a.rae);
+
+                let waiverHtml = "";
+                waiverTargets.slice(0, 10).forEach(w => {
+                    const p = playersDb[w.pid] || {};
+                    waiverHtml += `
+                        <div class="card">
+                            <div class="card-left">
+                                <span class="player-name">${p.first_name || ''} ${p.last_name || w.pid}</span>
+                                <span class="player-meta">${p.position || 'N/A'} - ${p.team || 'FA'} | PPG: ${w.ppg.toFixed(1)} | SD: ${w.sd.toFixed(1)}</span>
+                            </div>
+                            <div class="card-right">
+                                <span class="badge">RAE +${w.rae.toFixed(1)}</span>
+                            </div>
+                        </div>`;
+                });
+                document.getElementById('waiver-list').innerHTML = waiverTargets.length ? waiverHtml : "<div class='player-meta'>No waiver targets meeting criteria.</div>";
+
+                // 3. Process Drops Tab
+                let dropHtml = "";
+                myPlayers.filter(p => p.ppg > 0 && p.ppg < 6.0).sort((a, b) => a.ppg - b.ppg).forEach(d => {
+                    dropHtml += `
+                        <div class="card">
+                            <div class="card-left">
+                                <span class="player-name">⚠️ ${d.name}</span>
+                                <span class="player-meta">${d.pos} - ${d.team} | Real PPG: ${d.ppg.toFixed(1)} | ME: ${d.me.toFixed(1)}</span>
+                            </div>
+                            <div class="card-right">
+                                <span class="badge badge-danger">RAE ${d.rae.toFixed(1)}</span>
+                            </div>
+                        </div>`;
+                });
+                document.getElementById('drop-list').innerHTML = dropHtml || "<div class='player-meta'>No obvious drops on roster.</div>";
+
+                // 4. Process Trades Tab
+                let tradeHtml = "";
+                myRosterPids.forEach(pid => {
+                    const p = playersDb[pid] || {};
+                    const age = p.age || 0;
+                    const pos = p.position || 'N/A';
+                    const name = `${p.first_name || ''} ${p.last_name || pid}`.trim();
+                    const s = blendedStats[pid] || { ppg: 0, me: 0, rae: 0 };
+
+                    if ((["RB", "WR"].includes(pos) && age >= 27 && s.me <= -2.0) || (pos === "QB" && age >= 33 && s.me <= -2.0)) {
+                        tradeHtml += `
+                            <div class="card">
+                                <div class="card-left">
+                                    <span class="player-name">📉 SELL HIGH / TRADE: ${name}</span>
+                                    <span class="player-meta">${pos}, Age ${age} | PPG: ${s.ppg.toFixed(1)}</span>
+                                </div>
+                                <div class="card-right">
+                                    <span class="badge badge-danger">RAE ${s.rae.toFixed(1)}</span>
+                                </div>
+                            </div>`;
+                    } else if (s.me >= 3.0 && age <= 24) {
+                        tradeHtml += `
+                            <div class="card">
+                                <div class="card-left">
+                                    <span class="player-name">💎 UNTOUCHABLE CORE: ${name}</span>
+                                    <span class="player-meta">${pos}, Age ${age} | PPG: ${s.ppg.toFixed(1)}</span>
+                                </div>
+                                <div class="card-right">
+                                    <span class="badge">RAE +${s.rae.toFixed(1)}</span>
+                                </div>
+                            </div>`;
+                    }
+                });
+                document.getElementById('trade-list').innerHTML = tradeHtml || "<div class='player-meta'>No clear buy/sell alerts.</div>";
+
+                statusEl.innerText = "Data Synced Successfully!";
             } catch (err) {
-                alert("Error fetching Sleeper data. Check your connection.");
-            } finally {
-                document.getElementById('loading').style.display = 'none';
+                console.error(err);
+                statusEl.innerText = "Error syncing Sleeper data. Try again.";
             }
         }
     </script>
