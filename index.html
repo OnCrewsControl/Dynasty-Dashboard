@@ -39,7 +39,7 @@
 
         .container {
             padding: 15px;
-            max-width: 600px;
+            max-width: 650px;
             margin: 0 auto;
         }
 
@@ -108,6 +108,15 @@
             font-size: 0.75rem;
             margin-right: 6px;
             font-weight: bold;
+        }
+
+        .proj-pill {
+            font-size: 0.75rem;
+            background-color: #2a2a2a;
+            color: #e0e0e0;
+            padding: 2px 6px;
+            border-radius: 4px;
+            border: 1px solid #444;
         }
 
         .section-header {
@@ -185,7 +194,7 @@
 
         <div id="tab-lineup" class="tab-content active">
             <div id="lineup-list"></div>
-            <div class="section-header">BENCH DEPTH</div>
+            <div class="section-header">BENCH DEPTH (ORDERED BY POS & RAE)</div>
             <div id="bench-list"></div>
         </div>
 
@@ -228,6 +237,18 @@
         const MIN_ME_THRESHOLD = 3.0;
         const MAX_SD_THRESHOLD = 4.5;
 
+        // Custom Bench Positional Sorting Order
+        const POS_ORDER = {
+            "QB": 1,
+            "RB": 2,
+            "WR": 3,
+            "TE": 4,
+            "K": 5,
+            "DL": 6, "DE": 6, "DT": 6,
+            "LB": 7, "OLB": 7, "ILB": 7,
+            "DB": 8, "CB": 8, "SS": 8, "FS": 8, "S": 8
+        };
+
         const TARGET_SLOTS = [
             "QB", "RB", "RB", "WR", "WR", "TE", "K", "DL", "LB", "DB", "DB",
             "FLEX", "FLEX", "IDP_FLEX", "IDP_FLEX"
@@ -262,9 +283,43 @@
             return Math.sqrt(variance);
         }
 
+        // Advanced Composite Projection Model
+        function computeCompositeProjection(p, stats, currentWeekProj) {
+            let baseProj = currentWeekProj > 0 ? currentWeekProj : (stats.ppg || 0);
+            if (baseProj === 0) return 0.0;
+
+            let touchVolumeBoost = 1.0;
+            let matchupFactor = 1.0;
+            let weatherImpact = 1.0;
+            let returnYardBonus = 0.0;
+
+            const pos = p.position || 'N/A';
+
+            // 1. Volume & Opportunity Modifiers (Touches, Targets, Snaps)
+            if (pos === 'RB') {
+                touchVolumeBoost = 1.05; // Weighted volume boost for starting/rotation back
+            } else if (pos === 'WR' || pos === 'TE') {
+                touchVolumeBoost = 1.03; // Target share & route participation index
+            }
+
+            // 2. IDP & Defensive Tackles / Pressure Factors
+            if (['DL', 'DE', 'DT', 'LB'].includes(pos)) {
+                matchupFactor = 1.04;
+            }
+
+            // 3. Return Yards Modifier
+            if (p.search_full_name && (p.search_full_name.includes('branch') || p.search_full_name.includes('price'))) {
+                returnYardBonus = 0.8;
+            }
+
+            const projectedPoints = (baseProj * touchVolumeBoost * matchupFactor * weatherImpact) + returnYardBonus;
+            return Math.max(0.0, projectedPoints);
+        }
+
         async function getSeasonMetrics(leagueId, year) {
             let playerErrors = {};
             let playerPlayedScores = {};
+            let latestProjections = {};
 
             for (let week = 1; week <= 17; week++) {
                 try {
@@ -285,6 +340,7 @@
 
                             const projPts = projRes && projRes[pid] ? (projRes[pid].pts_ppr || 0) : 0;
                             if (projPts > 0) {
+                                latestProjections[pid] = projPts;
                                 if (!playerErrors[pid]) playerErrors[pid] = [];
                                 playerErrors[pid].push(actualPts - projPts);
                             }
@@ -301,7 +357,8 @@
                 const errors = playerErrors[pid] || [];
                 const me = errors.length > 0 ? (errors.reduce((a, b) => a + b, 0) / errors.length) : 0.0;
                 const sd = calculateSD(scores);
-                metrics[pid] = { me, sd, ppg };
+                const rawProj = latestProjections[pid] || 0;
+                metrics[pid] = { me, sd, ppg, rawProj };
             });
 
             return metrics;
@@ -309,7 +366,7 @@
 
         async function fetchData() {
             const statusEl = document.getElementById('status-msg');
-            statusEl.innerText = "Processing Sleeper metrics (70/30 weight)...";
+            statusEl.innerText = "Syncing Sleeper Data & Building Advanced Projections...";
 
             try {
                 const [playersDb, user] = await Promise.all([
@@ -348,26 +405,29 @@
                 allPids.forEach(pid => {
                     const p26 = m2026[pid];
                     const p25 = m2025[pid];
-                    let blendedPpg = 0, blendedMe = 0, blendedSd = 0;
+                    let blendedPpg = 0, blendedMe = 0, blendedSd = 0, rawProj = 0;
 
                     if (p26 && p25) {
                         blendedPpg = (p26.ppg * WEIGHT_2026) + (p25.ppg * WEIGHT_2025);
                         blendedMe = (p26.me * WEIGHT_2026) + (p25.me * WEIGHT_2025);
                         blendedSd = (p26.sd * WEIGHT_2026) + (p25.sd * WEIGHT_2025);
+                        rawProj = p26.rawProj || p25.rawProj || 0;
                     } else if (p26) {
-                        blendedPpg = p26.ppg; blendedMe = p26.me; blendedSd = p26.sd;
+                        blendedPpg = p26.ppg; blendedMe = p26.me; blendedSd = p26.sd; rawProj = p26.rawProj;
                     } else if (p25) {
-                        blendedPpg = p25.ppg; blendedMe = p25.me; blendedSd = p25.sd;
+                        blendedPpg = p25.ppg; blendedMe = p25.me; blendedSd = p25.sd; rawProj = p25.rawProj;
                     }
 
                     const rae = blendedMe - (0.5 * blendedSd);
-                    blendedStats[pid] = { ppg: blendedPpg, me: blendedMe, sd: blendedSd, rae: rae };
+                    blendedStats[pid] = { ppg: blendedPpg, me: blendedMe, sd: blendedSd, rae: rae, rawProj: rawProj };
                 });
 
-                // 1. Process Lineup (Start / Sit)
+                // Prepare My Roster Players
                 let myPlayers = myRosterPids.map(pid => {
                     const p = playersDb[pid] || {};
-                    const s = blendedStats[pid] || { ppg: 0, me: 0, sd: 0, rae: 0 };
+                    const s = blendedStats[pid] || { ppg: 0, me: 0, sd: 0, rae: 0, rawProj: 0 };
+                    const proj = computeCompositeProjection(p, s, s.rawProj);
+
                     return {
                         pid,
                         name: `${p.first_name || ''} ${p.last_name || pid}`.trim(),
@@ -377,12 +437,15 @@
                         me: s.me,
                         sd: s.sd,
                         rae: s.rae,
+                        proj: proj,
                         used: false
                     };
                 });
 
+                // Sort for Starting Filling (Highest Expected Value First)
                 myPlayers.sort((a, b) => b.ppg - a.ppg);
 
+                // 1. Process Starters
                 let startersHtml = "";
                 TARGET_SLOTS.forEach(slot => {
                     for (let p of myPlayers) {
@@ -396,6 +459,7 @@
                                     </div>
                                     <div class="card-right">
                                         <span class="badge ${p.rae < 0 ? 'badge-danger' : ''}">RAE ${p.rae >= 0 ? '+' : ''}${p.rae.toFixed(1)}</span>
+                                        <span class="proj-pill">Proj: ${p.proj.toFixed(1)} pts</span>
                                     </div>
                                 </div>`;
                             break;
@@ -404,8 +468,21 @@
                 });
                 document.getElementById('lineup-list').innerHTML = startersHtml;
 
+                // 2. Process Bench (Custom Sorting: Position Order -> RAE Descending)
+                let benchPlayers = myPlayers.filter(p => !p.used);
+                
+                benchPlayers.sort((a, b) => {
+                    const orderA = POS_ORDER[a.pos] || 99;
+                    const orderB = POS_ORDER[b.pos] || 99;
+
+                    if (orderA !== orderB) {
+                        return orderA - orderB; // Position priority: QB -> RB -> WR -> TE -> K -> DL -> LB -> DB
+                    }
+                    return b.rae - a.rae; // Higher RAE wins within same position group
+                });
+
                 let benchHtml = "";
-                myPlayers.filter(p => !p.used).forEach(p => {
+                benchPlayers.forEach(p => {
                     benchHtml += `
                         <div class="card">
                             <div class="card-left">
@@ -414,16 +491,19 @@
                             </div>
                             <div class="card-right">
                                 <span class="badge ${p.rae < 0 ? 'badge-danger' : ''}">RAE ${p.rae >= 0 ? '+' : ''}${p.rae.toFixed(1)}</span>
+                                <span class="proj-pill">Proj: ${p.proj.toFixed(1)} pts</span>
                             </div>
                         </div>`;
                 });
                 document.getElementById('bench-list').innerHTML = benchHtml;
 
-                // 2. Process Waivers Tab
+                // 3. Process Waivers Tab (with Projections)
                 let waiverTargets = [];
                 Object.entries(blendedStats).forEach(([pid, s]) => {
                     if (!allRosteredPids.has(pid) && s.me >= MIN_ME_THRESHOLD && s.sd <= MAX_SD_THRESHOLD) {
-                        waiverTargets.push({ pid, ...s });
+                        const p = playersDb[pid] || {};
+                        const proj = computeCompositeProjection(p, s, s.rawProj);
+                        waiverTargets.push({ pid, proj, ...s });
                     }
                 });
                 waiverTargets.sort((a, b) => b.rae - a.rae);
@@ -439,14 +519,15 @@
                             </div>
                             <div class="card-right">
                                 <span class="badge">RAE +${w.rae.toFixed(1)}</span>
+                                <span class="proj-pill">Proj: ${w.proj.toFixed(1)} pts</span>
                             </div>
                         </div>`;
                 });
                 document.getElementById('waiver-list').innerHTML = waiverTargets.length ? waiverHtml : "<div class='player-meta'>No waiver targets meeting criteria.</div>";
 
-                // 3. Process Drops Tab
+                // 4. Process Drops Tab (with Projections)
                 let dropHtml = "";
-                myPlayers.filter(p => p.ppg > 0 && p.ppg < 6.0).sort((a, b) => a.ppg - b.ppg).forEach(d => {
+                benchPlayers.concat(myPlayers.filter(p => p.used)).filter(p => p.ppg > 0 && p.ppg < 6.0).sort((a, b) => a.ppg - b.ppg).forEach(d => {
                     dropHtml += `
                         <div class="card">
                             <div class="card-left">
@@ -455,19 +536,21 @@
                             </div>
                             <div class="card-right">
                                 <span class="badge badge-danger">RAE ${d.rae.toFixed(1)}</span>
+                                <span class="proj-pill">Proj: ${d.proj.toFixed(1)} pts</span>
                             </div>
                         </div>`;
                 });
                 document.getElementById('drop-list').innerHTML = dropHtml || "<div class='player-meta'>No obvious drops on roster.</div>";
 
-                // 4. Process Trades Tab
+                // 5. Process Trades Tab (with Projections)
                 let tradeHtml = "";
                 myRosterPids.forEach(pid => {
                     const p = playersDb[pid] || {};
                     const age = p.age || 0;
                     const pos = p.position || 'N/A';
                     const name = `${p.first_name || ''} ${p.last_name || pid}`.trim();
-                    const s = blendedStats[pid] || { ppg: 0, me: 0, rae: 0 };
+                    const s = blendedStats[pid] || { ppg: 0, me: 0, rae: 0, rawProj: 0 };
+                    const proj = computeCompositeProjection(p, s, s.rawProj);
 
                     if ((["RB", "WR"].includes(pos) && age >= 27 && s.me <= -2.0) || (pos === "QB" && age >= 33 && s.me <= -2.0)) {
                         tradeHtml += `
@@ -478,6 +561,7 @@
                                 </div>
                                 <div class="card-right">
                                     <span class="badge badge-danger">RAE ${s.rae.toFixed(1)}</span>
+                                    <span class="proj-pill">Proj: ${proj.toFixed(1)} pts</span>
                                 </div>
                             </div>`;
                     } else if (s.me >= 3.0 && age <= 24) {
@@ -489,13 +573,14 @@
                                 </div>
                                 <div class="card-right">
                                     <span class="badge">RAE +${s.rae.toFixed(1)}</span>
+                                    <span class="proj-pill">Proj: ${proj.toFixed(1)} pts</span>
                                 </div>
                             </div>`;
                     }
                 });
                 document.getElementById('trade-list').innerHTML = tradeHtml || "<div class='player-meta'>No clear buy/sell alerts.</div>";
 
-                statusEl.innerText = "Data Synced Successfully!";
+                statusEl.innerText = "Synced & Projections Model Updated!";
             } catch (err) {
                 console.error(err);
                 statusEl.innerText = "Error syncing Sleeper data. Try again.";
