@@ -284,6 +284,19 @@
         const MAX_SD_THRESHOLD = 4.5;
         let currentMode = 'floor'; 
 
+        // 2026 NFL Bye Week Schedule Matrix (Fallback Guardrail)
+        const BYE_WEEKS_2026 = {
+            5: ["DET", "LAC", "PHI", "TEN"],
+            6: ["KC", "LAR", "MIA", "MIN"],
+            7: ["CHI", "DAL"],
+            8: ["ARI", "GB"],
+            9: ["CLE", "NYG", "PIT", "SF"],
+            10: ["ATL", "BUF", "CIN", "JAX"],
+            11: ["BAL", "DEN", "IND", "NE"],
+            12: ["CAR", "NYJ"],
+            14: ["HOU", "LV", "NO", "SEA", "TB", "WAS"]
+        };
+
         const DVP_MAP = {
             "CAR": { QB: 1.12, RB: 1.15, WR: 1.10, TE: 1.08, DL: 1.05, LB: 1.10, DB: 1.08 },
             "ARI": { QB: 1.10, RB: 1.12, WR: 1.08, TE: 1.12, DL: 1.02, LB: 1.08, DB: 1.06 },
@@ -382,18 +395,19 @@
             return result;
         }
 
-        function computeNflverseProjection(p, stats, nflStats, activeTeamsThisWeek) {
+        function computeNflverseProjection(p, stats, nflStats, activeTeamsThisWeek, currentWeek) {
             const team = (p.team || '').toUpperCase();
             const injStatus = p.injury_status;
 
-            // 1. HARD GUARDRAIL: Bye Week Detection
-            if (team && activeTeamsThisWeek.size > 0 && !activeTeamsThisWeek.has(team)) {
+            // 1. HARD GUARDRAIL: Bye Week Detection (Schedule API + 2026 Matrix)
+            const scheduledByeTeams = BYE_WEEKS_2026[currentWeek] || [];
+            if (scheduledByeTeams.includes(team) || (team && activeTeamsThisWeek.size > 0 && !activeTeamsThisWeek.has(team))) {
                 return { proj: 0.0, isInactive: true, reason: 'BYE' };
             }
 
             // 2. HARD GUARDRAIL: Injury Detection (Out / IR / PUP / Doubtful)
             if (["Out", "IR", "PUP", "Doubtful"].includes(injStatus)) {
-                return { proj: 0.0, isInactive: true, reason: injStatus.toUpperCase() };
+                return { proj: 0.0, isInactive: true, reason: (injStatus || 'INJURED').toUpperCase() };
             }
 
             let baseline = (stats.ppg || 0) + (0.3 * (stats.me || 0)) - (0.2 * (stats.sd || 0));
@@ -438,7 +452,6 @@
                 projection = (projection * 0.80) + defensiveBonus;
             }
 
-            // Questionable Injury Multiplier (15% penalty)
             if (injStatus === "Questionable") {
                 projection *= 0.85;
             }
@@ -497,7 +510,6 @@
             statusEl.innerText = "Syncing Schedule, Byes, Injuries & Projections...";
 
             try {
-                // Fetch State (Current NFL Week), Players, and nflverse Stats
                 const [nflState, playersDb, user, nflverseCsvText] = await Promise.all([
                     fetch("https://api.sleeper.app/v1/state/nfl").then(r => r.json()).catch(() => ({ week: 6, season: "2026" })),
                     fetch("https://api.sleeper.app/v1/players/nfl").then(r => r.json()),
@@ -509,18 +521,14 @@
                 const currentWeek = nflState.display_week || nflState.week || 6;
                 const currentSeason = nflState.season || "2026";
 
-                // Fetch Active Teams Playing in Current Week to filter Out BYE Teams
                 let activeTeamsThisWeek = new Set();
                 try {
-                    const weekSchedule = await fetch(`https://api.sleeper.app/v1/schedule/nfl/regular/${currentSeason}/${currentWeek}`).then(r => r.json());
-                    if (Array.isArray(weekSchedule)) {
-                        weekSchedule.forEach(game => {
-                            if (game.home_team) activeTeamsThisWeek.add(game.home_team.toUpperCase());
-                            if (game.away_team) activeTeamsThisWeek.add(game.away_team.toUpperCase());
-                        });
-                    }
+                    const weekProjections = await fetch(`https://api.sleeper.app/v1/projections/nfl/regular/${currentSeason}/${currentWeek}`).then(r => r.json());
+                    Object.values(weekProjections || {}).forEach(p => {
+                        if (p && p.team) activeTeamsThisWeek.add(p.team.toUpperCase());
+                    });
                 } catch (e) {
-                    console.log("Schedule fetch error; relying on default BYE logic.");
+                    console.log("Schedule projection fallback active.");
                 }
 
                 let nflStatsMap = {};
@@ -622,7 +630,7 @@
                 let myPlayers = myRosterPids.map(pid => {
                     const p = playersDb[pid] || {};
                     const s = blendedStats[pid] || { ppg: 0, me: 0, sd: 0, rae: 0 };
-                    const projResult = computeNflverseProjection(p, s, nflStatsMap, activeTeamsThisWeek);
+                    const projResult = computeNflverseProjection(p, s, nflStatsMap, activeTeamsThisWeek, currentWeek);
 
                     return {
                         pid,
@@ -646,7 +654,7 @@
                     myPlayers.sort((a, b) => (b.proj + b.sd) - (a.proj + a.sd));
                 }
 
-                // 1. Process Starters (Inactives/Byes Auto-Benched)
+                // 1. Process Starters
                 let startersHtml = "";
                 TARGET_SLOTS.forEach(slot => {
                     for (let p of myPlayers) {
@@ -703,7 +711,7 @@
                 Object.entries(blendedStats).forEach(([pid, s]) => {
                     if (!allRosteredPids.has(pid) && s.me >= MIN_ME_THRESHOLD && s.sd <= MAX_SD_THRESHOLD) {
                         const p = playersDb[pid] || {};
-                        const projResult = computeNflverseProjection(p, s, nflStatsMap, activeTeamsThisWeek);
+                        const projResult = computeNflverseProjection(p, s, nflStatsMap, activeTeamsThisWeek, currentWeek);
                         if (!projResult.isInactive) {
                             waiverTargets.push({ pid, proj: projResult.proj, ...s });
                         }
@@ -753,7 +761,7 @@
                     const pos = p.position || 'N/A';
                     const name = `${p.first_name || ''} ${p.last_name || pid}`.trim();
                     const s = blendedStats[pid] || { ppg: 0, me: 0, rae: 0 };
-                    const projResult = computeNflverseProjection(p, s, nflStatsMap, activeTeamsThisWeek);
+                    const projResult = computeNflverseProjection(p, s, nflStatsMap, activeTeamsThisWeek, currentWeek);
 
                     if ((["RB", "WR"].includes(pos) && age >= 27 && s.me <= -2.0) || (pos === "QB" && age >= 33 && s.me <= -2.0)) {
                         tradeHtml += `
