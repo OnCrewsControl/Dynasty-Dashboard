@@ -145,6 +145,16 @@
             font-weight: bold;
         }
 
+        .proj-pill-inactive {
+            font-size: 0.75rem;
+            background-color: rgba(255, 82, 82, 0.15);
+            color: var(--danger-color);
+            padding: 2px 6px;
+            border-radius: 4px;
+            border: 1px solid var(--danger-color);
+            font-weight: bold;
+        }
+
         .section-header {
             font-size: 0.9rem;
             font-weight: bold;
@@ -272,9 +282,8 @@
         const WEIGHT_2025 = 0.30;
         const MIN_ME_THRESHOLD = 3.0;
         const MAX_SD_THRESHOLD = 4.5;
-        let currentMode = 'floor'; // 'floor' or 'upside'
+        let currentMode = 'floor'; 
 
-        // Dynamic DVP Map (Points Allowed vs League Average)
         const DVP_MAP = {
             "CAR": { QB: 1.12, RB: 1.15, WR: 1.10, TE: 1.08, DL: 1.05, LB: 1.10, DB: 1.08 },
             "ARI": { QB: 1.10, RB: 1.12, WR: 1.08, TE: 1.12, DL: 1.02, LB: 1.08, DB: 1.06 },
@@ -373,7 +382,20 @@
             return result;
         }
 
-        function computeNflverseProjection(p, stats, nflStats) {
+        function computeNflverseProjection(p, stats, nflStats, activeTeamsThisWeek) {
+            const team = (p.team || '').toUpperCase();
+            const injStatus = p.injury_status;
+
+            // 1. HARD GUARDRAIL: Bye Week Detection
+            if (team && activeTeamsThisWeek.size > 0 && !activeTeamsThisWeek.has(team)) {
+                return { proj: 0.0, isInactive: true, reason: 'BYE' };
+            }
+
+            // 2. HARD GUARDRAIL: Injury Detection (Out / IR / PUP / Doubtful)
+            if (["Out", "IR", "PUP", "Doubtful"].includes(injStatus)) {
+                return { proj: 0.0, isInactive: true, reason: injStatus.toUpperCase() };
+            }
+
             let baseline = (stats.ppg || 0) + (0.3 * (stats.me || 0)) - (0.2 * (stats.sd || 0));
             if (baseline <= 0) baseline = stats.ppg || 4.0;
 
@@ -416,8 +438,13 @@
                 projection = (projection * 0.80) + defensiveBonus;
             }
 
+            // Questionable Injury Multiplier (15% penalty)
+            if (injStatus === "Questionable") {
+                projection *= 0.85;
+            }
+
             const cap = POS_CAPS[pos] || 25.0;
-            return Math.min(cap, Math.max(1.0, projection));
+            return { proj: Math.min(cap, Math.max(1.0, projection)), isInactive: false, reason: '' };
         }
 
         async function getSeasonMetrics(leagueId, year) {
@@ -467,15 +494,34 @@
 
         async function fetchData() {
             const statusEl = document.getElementById('status-msg');
-            statusEl.innerText = "Syncing Sleeper Data & Building DVP Projections...";
+            statusEl.innerText = "Syncing Schedule, Byes, Injuries & Projections...";
 
             try {
-                const [playersDb, user, nflverseCsvText] = await Promise.all([
+                // Fetch State (Current NFL Week), Players, and nflverse Stats
+                const [nflState, playersDb, user, nflverseCsvText] = await Promise.all([
+                    fetch("https://api.sleeper.app/v1/state/nfl").then(r => r.json()).catch(() => ({ week: 6, season: "2026" })),
                     fetch("https://api.sleeper.app/v1/players/nfl").then(r => r.json()),
                     fetch(`https://api.sleeper.app/v1/user/${USERNAME}`).then(r => r.json()),
                     fetch("https://github.com/nflverse/nflverse-data/releases/download/player_stats/stats_player_week_2025.csv")
                         .then(r => r.text()).catch(() => "")
                 ]);
+
+                const currentWeek = nflState.display_week || nflState.week || 6;
+                const currentSeason = nflState.season || "2026";
+
+                // Fetch Active Teams Playing in Current Week to filter Out BYE Teams
+                let activeTeamsThisWeek = new Set();
+                try {
+                    const weekSchedule = await fetch(`https://api.sleeper.app/v1/schedule/nfl/regular/${currentSeason}/${currentWeek}`).then(r => r.json());
+                    if (Array.isArray(weekSchedule)) {
+                        weekSchedule.forEach(game => {
+                            if (game.home_team) activeTeamsThisWeek.add(game.home_team.toUpperCase());
+                            if (game.away_team) activeTeamsThisWeek.add(game.away_team.toUpperCase());
+                        });
+                    }
+                } catch (e) {
+                    console.log("Schedule fetch error; relying on default BYE logic.");
+                }
 
                 let nflStatsMap = {};
                 if (nflverseCsvText) {
@@ -576,7 +622,7 @@
                 let myPlayers = myRosterPids.map(pid => {
                     const p = playersDb[pid] || {};
                     const s = blendedStats[pid] || { ppg: 0, me: 0, sd: 0, rae: 0 };
-                    const proj = computeNflverseProjection(p, s, nflStatsMap);
+                    const projResult = computeNflverseProjection(p, s, nflStatsMap, activeTeamsThisWeek);
 
                     return {
                         pid,
@@ -587,22 +633,24 @@
                         me: s.me,
                         sd: s.sd,
                         rae: s.rae,
-                        proj: proj,
+                        proj: projResult.proj,
+                        isInactive: projResult.isInactive,
+                        reason: projResult.reason,
                         used: false
                     };
                 });
 
                 if (currentMode === 'floor') {
-                    myPlayers.sort((a, b) => (b.ppg - b.sd) - (a.ppg - a.sd));
+                    myPlayers.sort((a, b) => (b.proj - b.sd) - (a.proj - a.sd));
                 } else {
                     myPlayers.sort((a, b) => (b.proj + b.sd) - (a.proj + a.sd));
                 }
 
-                // 1. Process Starters
+                // 1. Process Starters (Inactives/Byes Auto-Benched)
                 let startersHtml = "";
                 TARGET_SLOTS.forEach(slot => {
                     for (let p of myPlayers) {
-                        if (!p.used && isEligible(p.pos, slot)) {
+                        if (!p.used && !p.isInactive && isEligible(p.pos, slot)) {
                             p.used = true;
                             startersHtml += `
                                 <div class="card">
@@ -633,6 +681,9 @@
 
                 let benchHtml = "";
                 benchPlayers.forEach(p => {
+                    const pillClass = p.isInactive ? "proj-pill-inactive" : "proj-pill";
+                    const projText = p.isInactive ? `🚑 ${p.reason}` : `Proj: ${p.proj.toFixed(1)} pts`;
+
                     benchHtml += `
                         <div class="card">
                             <div class="card-left">
@@ -641,7 +692,7 @@
                             </div>
                             <div class="card-right">
                                 <span class="badge ${p.rae < 0 ? 'badge-danger' : ''}">RAE ${p.rae >= 0 ? '+' : ''}${p.rae.toFixed(1)}</span>
-                                <span class="proj-pill">Proj: ${p.proj.toFixed(1)} pts</span>
+                                <span class="${pillClass}">${projText}</span>
                             </div>
                         </div>`;
                 });
@@ -652,8 +703,10 @@
                 Object.entries(blendedStats).forEach(([pid, s]) => {
                     if (!allRosteredPids.has(pid) && s.me >= MIN_ME_THRESHOLD && s.sd <= MAX_SD_THRESHOLD) {
                         const p = playersDb[pid] || {};
-                        const proj = computeNflverseProjection(p, s, nflStatsMap);
-                        waiverTargets.push({ pid, proj, ...s });
+                        const projResult = computeNflverseProjection(p, s, nflStatsMap, activeTeamsThisWeek);
+                        if (!projResult.isInactive) {
+                            waiverTargets.push({ pid, proj: projResult.proj, ...s });
+                        }
                     }
                 });
                 waiverTargets.sort((a, b) => b.rae - a.rae);
@@ -700,7 +753,7 @@
                     const pos = p.position || 'N/A';
                     const name = `${p.first_name || ''} ${p.last_name || pid}`.trim();
                     const s = blendedStats[pid] || { ppg: 0, me: 0, rae: 0 };
-                    const proj = computeNflverseProjection(p, s, nflStatsMap);
+                    const projResult = computeNflverseProjection(p, s, nflStatsMap, activeTeamsThisWeek);
 
                     if ((["RB", "WR"].includes(pos) && age >= 27 && s.me <= -2.0) || (pos === "QB" && age >= 33 && s.me <= -2.0)) {
                         tradeHtml += `
@@ -711,7 +764,7 @@
                                 </div>
                                 <div class="card-right">
                                     <span class="badge badge-danger">RAE ${s.rae.toFixed(1)}</span>
-                                    <span class="proj-pill">Proj: ${proj.toFixed(1)} pts</span>
+                                    <span class="proj-pill">Proj: ${projResult.proj.toFixed(1)} pts</span>
                                 </div>
                             </div>`;
                     } else if (s.me >= 3.0 && age <= 24) {
@@ -723,14 +776,14 @@
                                 </div>
                                 <div class="card-right">
                                     <span class="badge">RAE +${s.rae.toFixed(1)}</span>
-                                    <span class="proj-pill">Proj: ${proj.toFixed(1)} pts</span>
+                                    <span class="proj-pill">Proj: ${projResult.proj.toFixed(1)} pts</span>
                                 </div>
                             </div>`;
                     }
                 });
                 document.getElementById('trade-list').innerHTML = tradeHtml || "<div class='player-meta'>No clear buy/sell alerts.</div>";
 
-                statusEl.innerText = "Synced with DVP Matchup Scaling!";
+                statusEl.innerText = `Week ${currentWeek} Data Synced (Byes & Injuries Filtered)!`;
             } catch (err) {
                 console.error(err);
                 statusEl.innerText = "Error syncing data. Check network connection.";
