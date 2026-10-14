@@ -284,29 +284,25 @@
         const MAX_SD_THRESHOLD = 4.5;
         let currentMode = 'floor'; 
 
-        // Hardcoded NFL Bye Schedule Matrix
+        // Official 2026 NFL Bye Schedule Matrix
         const BYE_TEAMS_BY_WEEK = {
-            5: ["DET", "LAC", "PHI", "TEN"],
-            6: ["KC", "LAR", "MIA", "MIN"],
-            7: ["CHI", "DAL"],
-            8: ["ARI", "GB"],
-            9: ["CLE", "NYG", "PIT", "SF"],
-            10: ["ATL", "BUF", "CIN", "JAX"],
-            11: ["BAL", "DEN", "IND", "NE"],
-            12: ["CAR", "NYJ"],
-            14: ["HOU", "LV", "NO", "SEA", "TB", "WAS"]
+            5: ["KC", "CAR"],
+            6: ["CIN", "DET", "MIA", "MIN"],
+            7: ["BUF", "LAC", "WAS", "JAX"],
+            8: ["NYG", "NO", "SF", "HOU"],
+            9: ["PIT", "TEN"],
+            10: ["DEN", "PHI", "CHI", "TB"],
+            11: ["NE", "CLE", "SEA", "GB", "ATL", "LAR"],
+            13: ["IND", "NYJ", "LV", "BAL"],
+            14: ["DAL", "ARI"]
         };
 
-        const DVP_MAP = {
-            "CAR": { QB: 1.12, RB: 1.15, WR: 1.10, TE: 1.08, DL: 1.05, LB: 1.10, DB: 1.08 },
-            "ARI": { QB: 1.10, RB: 1.12, WR: 1.08, TE: 1.12, DL: 1.02, LB: 1.08, DB: 1.06 },
-            "LV":  { QB: 1.08, RB: 1.10, WR: 1.09, TE: 1.05, DL: 1.04, LB: 1.06, DB: 1.05 },
-            "WAS": { QB: 1.14, RB: 1.08, WR: 1.12, TE: 1.10, DL: 1.06, LB: 1.05, DB: 1.10 },
-            "SF":  { QB: 0.88, RB: 0.85, WR: 0.90, TE: 0.88, DL: 0.92, LB: 0.90, DB: 0.92 },
-            "BAL": { QB: 0.86, RB: 0.88, WR: 0.88, TE: 0.92, DL: 0.90, LB: 0.88, DB: 0.90 },
-            "NYJ": { QB: 0.84, RB: 0.92, WR: 0.82, TE: 0.90, DL: 0.95, LB: 0.92, DB: 0.85 },
-            "CLE": { QB: 0.85, RB: 0.86, WR: 0.86, TE: 0.85, DL: 0.90, LB: 0.88, DB: 0.88 },
-            "DEFAULT": { QB: 1.0, RB: 1.0, WR: 1.0, TE: 1.0, DL: 1.0, LB: 1.0, DB: 1.0 }
+        // Opponent Offensive Line Win-Rate Matchup Multipliers for IDP Pass Rushers (Watt, Crosby, etc.)
+        // Lower win rate = weaker pass blocking = higher pressure/sack upside multiplier.
+        const OPP_OL_ALLOW_MAP = {
+            "CAR": 1.15, "ARI": 1.12, "LV": 1.10, "WAS": 1.14,
+            "SF": 0.88, "BAL": 0.86, "NYJ": 0.84, "CLE": 0.85,
+            "DET": 0.87, "PHI": 0.85, "KC": 0.90, "DEFAULT": 1.0
         };
 
         const POS_ORDER = {
@@ -381,18 +377,18 @@
             const team = (p.team || '').toUpperCase();
             const injStatus = p.injury_status;
 
-            // Direct Bye Week Filtering
+            // 1. Bye Week Guardrail
             const byeTeamsThisWeek = BYE_TEAMS_BY_WEEK[currentWeek] || [];
             if (team && byeTeamsThisWeek.includes(team)) {
                 return { proj: 0.0, isInactive: true, reason: 'BYE' };
             }
 
-            // Injury Status Filtering
+            // 2. Injury Guardrail
             if (["Out", "IR", "PUP", "Doubtful"].includes(injStatus)) {
                 return { proj: 0.0, isInactive: true, reason: (injStatus || 'INJURED').toUpperCase() };
             }
 
-            let baseline = (stats.ppg || 0) + (0.2 * (stats.me || 0));
+            let baseline = (stats.ppg || 0) + (0.3 * (stats.me || 0));
             if (baseline <= 0) baseline = stats.ppg || 4.0;
 
             const pos = (p.position || 'N/A').toUpperCase();
@@ -401,6 +397,7 @@
             const ns = nflStats[fullNameKey] || nflStats[lastNameKey] || {};
 
             let projection = baseline;
+            const oppTeam = p.opponent || p.next_opponent || "";
 
             if (pos === 'RB') {
                 const touches = ns.avg_touches || 12.0;
@@ -409,8 +406,10 @@
                 const targetShare = ns.target_share || 0.16;
                 projection = (baseline * 0.75) + (targetShare * 20.0);
             } else if (['DL', 'DE', 'DT', 'LB', 'DB'].includes(pos)) {
+                // Scaled by Opponent OL Win-Rate (Pass Block weakness multiplier)
+                const olMultiplier = OPP_OL_ALLOW_MAP[oppTeam.toUpperCase()] || OPP_OL_ALLOW_MAP["DEFAULT"];
                 const tackles = ns.tackles_per_game || 4.0;
-                projection = (baseline * 0.80) + (tackles * 0.5);
+                projection = ((baseline * 0.80) + (tackles * 0.5)) * olMultiplier;
             }
 
             if (injStatus === "Questionable") {
@@ -467,7 +466,7 @@
 
         async function fetchData() {
             const statusEl = document.getElementById('status-msg');
-            statusEl.innerText = "Syncing Sleeper Data & Roster Filters...";
+            statusEl.innerText = "Syncing Sleeper Data & IDP Matchup Metrics...";
 
             try {
                 const [nflState, playersDb, user, nflverseCsvText] = await Promise.all([
@@ -578,11 +577,11 @@
                     };
                 });
 
-                // Starter Selection Score Logic: Weighted Baseline PPG + Composite Projections
+                // Starter Ranking Metric: 35% Baseline PPG + 35% Projected Model (ME) + 30% SD Weighting
                 myPlayers.sort((a, b) => {
                     if (a.isInactive !== b.isInactive) return a.isInactive ? 1 : -1;
-                    const scoreA = (a.ppg * 0.6) + (a.proj * 0.4) - (currentMode === 'floor' ? a.sd * 0.2 : -a.sd * 0.2);
-                    const scoreB = (b.ppg * 0.6) + (b.proj * 0.4) - (currentMode === 'floor' ? b.sd * 0.2 : -b.sd * 0.2);
+                    const scoreA = (a.ppg * 0.35) + (a.proj * 0.35) - (currentMode === 'floor' ? a.sd * 0.3 : -a.sd * 0.3);
+                    const scoreB = (b.ppg * 0.35) + (b.proj * 0.35) - (currentMode === 'floor' ? b.sd * 0.3 : -b.sd * 0.3);
                     return scoreB - scoreA;
                 });
 
@@ -609,7 +608,7 @@
                 });
                 document.getElementById('lineup-list').innerHTML = startersHtml;
 
-                // 2. Process Bench (Positional Priority Order -> RAE Descending)
+                // 2. Process Bench
                 let benchPlayers = myPlayers.filter(p => !p.used);
                 benchPlayers.sort((a, b) => {
                     const orderA = POS_ORDER[a.pos] || 99;
@@ -723,7 +722,7 @@
                 });
                 document.getElementById('trade-list').innerHTML = tradeHtml || "<div class='player-meta'>No clear buy/sell alerts.</div>";
 
-                statusEl.innerText = `Week ${currentWeek} Lineup Synced (Byes Filtered)!`;
+                statusEl.innerText = `Week ${currentWeek} Lineup Synced (35/35/30 Split Active)!`;
             } catch (err) {
                 console.error(err);
                 statusEl.innerText = "Error syncing data. Check network connection.";
